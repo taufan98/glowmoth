@@ -1,0 +1,748 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>Glowmoth — a night-garden arcade game</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b1026; }
+  #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: crosshair; }
+  /* Read aloud, never shown: the status line screen readers announce. */
+  #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Glowmoth: fly the moth with arrow keys, WASD, mouse or touch. Catch golden pollen, dodge red cinders and grey ash-wisps."></canvas>
+<p id="status" role="status" aria-live="polite"></p>
+<script>
+'use strict';
+/*
+ * GLOWMOTH — a night-garden arcade game (original, written for make.fun best-game-01).
+ *
+ * You are Pip, a glow-moth. Catch golden pollen drifting through the night
+ * garden, chain pickups into combos, grab rare moonpetals and leafhearts,
+ * and dodge red cinders and the ash-wisps that hunt your light.
+ *
+ * Goal: reach 750 points to earn the Night's Crown (level 5) — then keep
+ * flying in endless mode if you like. You have 3 lives; a cinder or a wisp
+ * costs one. Game over at 0 lives.
+ *
+ * Controls: Arrow keys / WASD to fly, or hold mouse / touch and drag to
+ * steer. P pauses, M mutes, Enter or Space starts / restarts.
+ * Query params (for screenshots / testing): ?shot=start|play|end&seed=N
+ *   start: title screen. play: mid-game with a seeded layout. end: game over.
+ */
+(function () {
+  var TAU = Math.PI * 2;
+  var canvas = document.getElementById('game');
+  var ctx = canvas.getContext('2d');
+  var statusEl = document.getElementById('status');
+
+  // ---------- deterministic RNG (seeded via ?seed=N, else time-based) ----------
+  var params = new URLSearchParams(location.search);
+  function hashSeed(str) {
+    var h = 2166136261 >>> 0;
+    for (var i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return h >>> 0;
+  }
+  var seed = params.has('seed') ? (parseInt(params.get('seed'), 10) || 1) : (Date.now() % 2147483647);
+  var rngState = hashSeed('glowmoth:' + seed);
+  function rnd() { // mulberry32
+    rngState |= 0; rngState = (rngState + 0x6D2B79F5) | 0;
+    var t = Math.imul(rngState ^ (rngState >>> 15), 1 | rngState);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  }
+  function rr(a, b) { return a + rnd() * (b - a); }
+  function pick(arr) { return arr[Math.floor(rnd() * arr.length)]; }
+
+  // ---------- audio (synthesised, no files) ----------
+  var audioCtx = null, muted = false;
+  function ac() {
+    if (!audioCtx) { try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { audioCtx = null; } }
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+    return audioCtx;
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (muted) return;
+    var c = ac(); if (!c) return;
+    var t0 = c.currentTime;
+    var o = c.createOscillator(), g = c.createGain();
+    o.type = type || 'sine';
+    o.frequency.setValueAtTime(freq, t0);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
+    g.gain.setValueAtTime(vol || 0.12, t0);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g); g.connect(c.destination);
+    o.start(t0); o.stop(t0 + dur + 0.02);
+  }
+  function sfx(name, combo) {
+    if (muted) return;
+    if (name === 'pickup') { var f = 520 * Math.pow(1.059, Math.min(combo || 0, 8)); tone(f, 0.12, 'sine', 0.14, f * 1.5); }
+    else if (name === 'petal') { tone(660, 0.18, 'triangle', 0.14, 990); setTimeout(function () { tone(990, 0.22, 'triangle', 0.12, 1320); }, 70); }
+    else if (name === 'heart') { tone(523, 0.15, 'sine', 0.14); setTimeout(function () { tone(784, 0.25, 'sine', 0.14); }, 90); }
+    else if (name === 'hurt') { tone(180, 0.3, 'sawtooth', 0.16, 60); }
+    else if (name === 'level') { [523, 659, 784].forEach(function (f, i) { setTimeout(function () { tone(f, 0.16, 'triangle', 0.13); }, i * 90); }); }
+    else if (name === 'win') { [523, 659, 784, 1047, 1319].forEach(function (f, i) { setTimeout(function () { tone(f, 0.3, 'triangle', 0.13); }, i * 110); }); }
+    else if (name === 'over') { [392, 330, 262, 196].forEach(function (f, i) { setTimeout(function () { tone(f, 0.28, 'sine', 0.12); }, i * 130); }); }
+  }
+
+  // ---------- state ----------
+  var W = 0, H = 0, DPR = 1;
+  var state = 'title'; // title | play | pause | over | win
+  var score = 0, best = 0, lives = 3, level = 1, combo = 0, comboT = 0;
+  var time = 0, shake = 0, freezeT = 0, invulnT = 0, hurtFlash = 0;
+  var endless = false, won = false;
+  var player = { x: 0, y: 0, vx: 0, vy: 0, r: 16 };
+  var motes = [];   // {kind:'pollen'|'petal'|'heart'|'cinder', x,y,vy,sway,phase,r}
+  var wisps = [];   // {x,y,vx,vy,r,phase}
+  var parts = [];   // particles {x,y,vx,vy,life,max,color,size}
+  var floats = [];  // floating texts {x,y,life,text,color}
+  var stars = [], fireflies = [];
+  var spawnT = { pollen: 0, cinder: 0, wisp: 0, petal: 6, heart: 14 };
+  var keys = {};
+  var pointer = { active: false, x: 0, y: 0 };
+  var lastAnnounce = 0;
+
+  try { best = parseInt(localStorage.getItem('glowmoth-best') || '0', 10) || 0; } catch (e) { best = 0; }
+  function saveBest() { try { localStorage.setItem('glowmoth-best', String(best)); } catch (e) { /* storage unavailable */ } }
+  function announce(msg) {
+    var now = Date.now();
+    if (now - lastAnnounce < 1500) return;
+    lastAnnounce = now;
+    statusEl.textContent = msg;
+  }
+
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = canvas.clientWidth; H = canvas.clientHeight;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    player.x = Math.min(Math.max(player.x, 20), W - 20);
+    player.y = Math.min(Math.max(player.y, 20), H - 20);
+  }
+  window.addEventListener('resize', resize);
+
+  function buildSky() {
+    stars = [];
+    for (var i = 0; i < 110; i++) stars.push({ x: rnd(), y: rnd() * 0.75, r: rr(0.5, 1.8), tw: rr(0, TAU), sp: rr(0.5, 2) });
+    fireflies = [];
+    for (var j = 0; j < 12; j++) fireflies.push({ x: rnd(), y: rr(0.15, 0.95), ph: rr(0, TAU), sp: rr(0.2, 0.6) });
+  }
+
+  function resetGame() {
+    score = 0; lives = 3; level = 1; combo = 0; comboT = 0;
+    freezeT = 0; invulnT = 0; shake = 0; hurtFlash = 0;
+    endless = false; won = false;
+    motes = []; wisps = []; parts = []; floats = [];
+    spawnT = { pollen: 0, cinder: 0.5, wisp: 4, petal: 6, heart: 14 };
+    player.x = W / 2; player.y = H * 0.72; player.vx = 0; player.vy = 0;
+  }
+  function startGame() { ac(); resetGame(); state = 'play'; announce('Game started. Catch the golden pollen!'); }
+
+  // ---------- spawning ----------
+  function spawnMote(kind) {
+    var m = { kind: kind, x: rr(24, W - 24), y: -24, phase: rr(0, TAU), sway: rr(0.4, 1.2) };
+    if (kind === 'pollen') { m.vy = rr(55, 95); m.r = 9; }
+    else if (kind === 'petal') { m.vy = rr(40, 60); m.r = 13; }
+    else if (kind === 'heart') { m.vy = rr(45, 60); m.r = 12; }
+    else { m.vy = rr(80, 140); m.r = 12; } // cinder
+    motes.push(m);
+  }
+  function spawnWisp() {
+    var edge = Math.floor(rnd() * 4), x, y;
+    if (edge === 0) { x = -20; y = rr(0, H * 0.6); }
+    else if (edge === 1) { x = W + 20; y = rr(0, H * 0.6); }
+    else if (edge === 2) { x = rr(0, W); y = -20; }
+    else { x = rr(0, W); y = H + 20; }
+    wisps.push({ x: x, y: y, vx: 0, vy: 0, r: 15, phase: rr(0, TAU) });
+  }
+  function burst(x, y, color, n, speed) {
+    for (var i = 0; i < n; i++) {
+      var a = rnd() * TAU, s = rr(speed * 0.3, speed);
+      parts.push({ x: x, y: y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: rr(0.35, 0.8), max: 0.8, color: color, size: rr(1.5, 3.5) });
+    }
+  }
+  function addFloat(x, y, text, color) { floats.push({ x: x, y: y, life: 1, text: text, color: color }); }
+
+  // ---------- scoring / damage ----------
+  function levelFor(s) { return Math.min(5, Math.floor(s / 150) + 1); }
+  function gainPoints(base, x, y, label) {
+    var pts = base * Math.max(1, combo);
+    score += pts;
+    addFloat(x, y - 14, '+' + pts + (label ? ' ' + label : ''), '#ffe9a8');
+    var nl = levelFor(score);
+    if (nl > level) {
+      level = nl;
+      sfx('level');
+      addFloat(player.x, player.y - 34, 'LEVEL ' + level + '!', '#9fd8ff');
+      burst(player.x, player.y, '#9fd8ff', 26, 160);
+      announce('Level ' + level);
+    }
+    if (!won && score >= 750) {
+      won = true; state = 'win';
+      sfx('win');
+      burst(player.x, player.y, '#ffd76a', 60, 260);
+      announce('Night\'s Crown earned! You win!');
+    }
+  }
+  function hurt(x, y) {
+    if (invulnT > 0) return;
+    lives -= 1; combo = 0; comboT = 0; invulnT = 1.6; shake = 14; hurtFlash = 0.35;
+    sfx('hurt');
+    burst(x, y, '#ff6b5e', 30, 220);
+    announce(lives > 0 ? 'Ouch! ' + lives + (lives === 1 ? ' life' : ' lives') + ' left.' : 'Game over.');
+    if (lives <= 0) {
+      state = 'over';
+      if (score > best) { best = score; saveBest(); }
+      sfx('over');
+    }
+  }
+
+  // ---------- update ----------
+  function update(dt) {
+    time += dt;
+    if (shake > 0) shake = Math.max(0, shake - dt * 30);
+    if (hurtFlash > 0) hurtFlash -= dt;
+    if (invulnT > 0) invulnT -= dt;
+    if (freezeT > 0) freezeT -= dt;
+    if (comboT > 0) { comboT -= dt; if (comboT <= 0) combo = 0; }
+
+    // player movement: keyboard accel, pointer steer
+    var ax = 0, ay = 0;
+    if (keys['arrowleft'] || keys['a']) ax -= 1;
+    if (keys['arrowright'] || keys['d']) ax += 1;
+    if (keys['arrowup'] || keys['w']) ay -= 1;
+    if (keys['arrowdown'] || keys['s']) ay += 1;
+    if (ax || ay) {
+      var len = Math.sqrt(ax * ax + ay * ay);
+      player.vx += (ax / len) * 2600 * dt;
+      player.vy += (ay / len) * 2600 * dt;
+    } else if (pointer.active) {
+      var dx = pointer.x - player.x, dy = pointer.y - player.y;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d > 6) { player.vx += (dx / d) * 2200 * dt; player.vy += (dy / d) * 2200 * dt; }
+    }
+    player.vx *= Math.pow(0.12, dt); player.vy *= Math.pow(0.12, dt);
+    var sp = Math.sqrt(player.vx * player.vx + player.vy * player.vy);
+    var maxSp = 430;
+    if (sp > maxSp) { player.vx *= maxSp / sp; player.vy *= maxSp / sp; }
+    player.x = Math.min(Math.max(player.x + player.vx * dt, 18), W - 18);
+    player.y = Math.min(Math.max(player.y + player.vy * dt, 18), H - 18);
+
+    // spawning (rates grow with level)
+    spawnT.pollen -= dt;
+    if (spawnT.pollen <= 0) { spawnMote('pollen'); spawnT.pollen = Math.max(0.32, 0.95 - level * 0.09) * rr(0.75, 1.25); }
+    spawnT.cinder -= dt;
+    if (spawnT.cinder <= 0) { spawnMote('cinder'); spawnT.cinder = Math.max(0.9, 2.4 - level * 0.25) * rr(0.8, 1.3); }
+    spawnT.petal -= dt;
+    if (spawnT.petal <= 0) { spawnMote('petal'); spawnT.petal = rr(10, 15); }
+    spawnT.heart -= dt;
+    if (spawnT.heart <= 0) { spawnMote('heart'); spawnT.heart = rr(20, 30); }
+    var wispCap = level >= 2 ? Math.min(4, level - 1) : 0;
+    spawnT.wisp -= dt;
+    if (spawnT.wisp <= 0 && wisps.length < wispCap) { spawnWisp(); spawnT.wisp = rr(5, 8); }
+
+    // motes fall + sway
+    for (var i = motes.length - 1; i >= 0; i--) {
+      var m = motes[i];
+      m.phase += dt * 2;
+      m.y += m.vy * dt;
+      m.x += Math.sin(m.phase) * m.sway * 22 * dt;
+      if (m.y > H + 30) { motes.splice(i, 1); continue; }
+      var mdx = m.x - player.x, mdy = m.y - player.y;
+      if (mdx * mdx + mdy * mdy < (m.r + player.r - 2) * (m.r + player.r - 2)) {
+        if (m.kind === 'pollen') {
+          combo = Math.min(5, combo + 1); comboT = 3;
+          sfx('pickup', combo);
+          burst(m.x, m.y, '#ffd76a', 10, 120);
+          gainPoints(10, m.x, m.y, combo > 1 ? 'x' + combo : '');
+        } else if (m.kind === 'petal') {
+          freezeT = 3; sfx('petal');
+          burst(m.x, m.y, '#8ecbff', 16, 140);
+          gainPoints(25, m.x, m.y, 'frost!');
+        } else if (m.kind === 'heart') {
+          if (lives < 5) lives += 1;
+          sfx('heart');
+          burst(m.x, m.y, '#7dffa8', 16, 140);
+          addFloat(m.x, m.y - 14, '+1 LIFE', '#7dffa8');
+        } else { // cinder
+          hurt(m.x, m.y);
+          if (state !== 'play') return;
+        }
+        motes.splice(i, 1);
+      }
+    }
+
+    // wisps hunt the player
+    var wSpeed = 55 + level * 14;
+    for (var j = wisps.length - 1; j >= 0; j--) {
+      var w = wisps[j];
+      w.phase += dt * 2;
+      var wdx = player.x - w.x, wdy = player.y - w.y;
+      var wd = Math.sqrt(wdx * wdx + wdy * wdy) || 1;
+      var f = freezeT > 0 ? 0.25 : 1;
+      w.vx += (wdx / wd) * wSpeed * f * dt * 3;
+      w.vy += (wdy / wd) * wSpeed * f * dt * 3;
+      w.vx *= Math.pow(0.4, dt); w.vy *= Math.pow(0.4, dt);
+      var wsp = Math.sqrt(w.vx * w.vx + w.vy * w.vy);
+      var wMax = wSpeed * f;
+      if (wsp > wMax) { w.vx *= wMax / wsp; w.vy *= wMax / wsp; }
+      w.x += w.vx * dt + Math.sin(w.phase) * 12 * dt;
+      w.y += w.vy * dt + Math.cos(w.phase * 0.8) * 12 * dt;
+      if (wd < w.r + player.r - 2) {
+        hurt(w.x, w.y);
+        wisps.splice(j, 1);
+        if (state !== 'play') return;
+      }
+    }
+
+    // particles + floats
+    for (var p = parts.length - 1; p >= 0; p--) {
+      var pt = parts[p];
+      pt.life -= dt;
+      if (pt.life <= 0) { parts.splice(p, 1); continue; }
+      pt.x += pt.vx * dt; pt.y += pt.vy * dt;
+      pt.vx *= Math.pow(0.2, dt); pt.vy *= Math.pow(0.2, dt);
+    }
+    for (var q = floats.length - 1; q >= 0; q--) {
+      floats[q].life -= dt * 0.9;
+      floats[q].y -= 34 * dt;
+      if (floats[q].life <= 0) floats.splice(q, 1);
+    }
+  }
+
+  // ---------- drawing ----------
+  function circle(x, y, r, color) { ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fillStyle = color; ctx.fill(); }
+  function glowCircle(x, y, r, color, alpha) {
+    var g = ctx.createRadialGradient(x, y, 0, x, y, r * 3);
+    g.addColorStop(0, color);
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(x, y, r * 3, 0, TAU); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  function drawBackground() {
+    var g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#0b1026'); g.addColorStop(0.6, '#131b3d'); g.addColorStop(1, '#1d2b4d');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    // moon
+    glowCircle(W * 0.84, H * 0.16, 34, 'rgba(255, 244, 200, 0.55)', 0.8);
+    circle(W * 0.84, H * 0.16, 30, '#fff3c4');
+    circle(W * 0.84 - 10, H * 0.16 - 6, 6, '#e8d9a0');
+    circle(W * 0.84 + 8, H * 0.16 + 10, 4, '#e8d9a0');
+    // stars
+    for (var i = 0; i < stars.length; i++) {
+      var s = stars[i];
+      ctx.globalAlpha = 0.35 + 0.4 * Math.abs(Math.sin(time * s.sp + s.tw));
+      circle(s.x * W, s.y * H, s.r, '#dfe8ff');
+    }
+    ctx.globalAlpha = 1;
+    // garden silhouette: rolling hills + grass tufts
+    ctx.fillStyle = '#0a1f1a';
+    ctx.beginPath(); ctx.moveTo(0, H);
+    ctx.bezierCurveTo(W * 0.25, H * 0.86, W * 0.4, H * 0.94, W * 0.62, H * 0.88);
+    ctx.bezierCurveTo(W * 0.8, H * 0.84, W * 0.9, H * 0.93, W, H * 0.9);
+    ctx.lineTo(W, H); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#0d2a20';
+    ctx.beginPath(); ctx.moveTo(0, H);
+    ctx.bezierCurveTo(W * 0.3, H * 0.93, W * 0.55, H * 0.98, W, H * 0.95);
+    ctx.lineTo(W, H); ctx.closePath(); ctx.fill();
+    // fireflies
+    for (var j = 0; j < fireflies.length; j++) {
+      var f = fireflies[j];
+      var fx = (f.x + Math.sin(time * f.sp + f.ph) * 0.02) * W;
+      var fy = (f.y + Math.cos(time * f.sp * 0.7 + f.ph) * 0.015) * H;
+      glowCircle(fx, fy, 3, 'rgba(190, 255, 170, 0.8)', 0.35 + 0.3 * Math.sin(time * 2 + f.ph));
+    }
+  }
+  function drawMoth(x, y, t) {
+    var flap = Math.sin(t * 18) * 0.55;
+    var bob = Math.sin(t * 3) * 2;
+    ctx.save();
+    ctx.translate(x, y + bob);
+    // glow
+    glowCircle(0, 0, 16, 'rgba(255, 214, 106, 0.9)', 0.55);
+    // wings
+    ctx.fillStyle = '#ffcf5e';
+    ctx.beginPath(); ctx.ellipse(-13, -6 - flap * 8, 13, 8 + flap * 4, -0.5 - flap * 0.3, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(13, -6 - flap * 8, 13, 8 + flap * 4, 0.5 + flap * 0.3, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#e8a93d';
+    ctx.beginPath(); ctx.ellipse(-11, 7, 9, 6, 0.5, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(11, 7, 9, 6, -0.5, 0, TAU); ctx.fill();
+    // body
+    ctx.fillStyle = '#5a3a1a';
+    ctx.beginPath(); ctx.ellipse(0, 0, 5, 11, 0, 0, TAU); ctx.fill();
+    // head + eyes
+    circle(0, -11, 4.5, '#5a3a1a');
+    circle(-1.8, -12, 1.4, '#fff');
+    circle(1.8, -12, 1.4, '#fff');
+    // antennae
+    ctx.strokeStyle = '#5a3a1a'; ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(-2, -14); ctx.quadraticCurveTo(-7, -20, -9, -23); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(2, -14); ctx.quadraticCurveTo(7, -20, 9, -23); ctx.stroke();
+    ctx.restore();
+  }
+  function drawMote(m) {
+    var bob = Math.sin(m.phase) * 2;
+    if (m.kind === 'pollen') {
+      glowCircle(m.x, m.y + bob, m.r, 'rgba(255, 214, 106, 0.9)', 0.7);
+      circle(m.x, m.y + bob, m.r, '#ffd76a');
+      circle(m.x - 3, m.y + bob - 3, 3, '#fff3c4');
+    } else if (m.kind === 'petal') {
+      glowCircle(m.x, m.y + bob, m.r, 'rgba(142, 203, 255, 0.9)', 0.7);
+      ctx.save(); ctx.translate(m.x, m.y + bob); ctx.rotate(Math.sin(m.phase * 0.7) * 0.6);
+      ctx.fillStyle = '#8ecbff';
+      ctx.beginPath(); ctx.ellipse(0, 0, 6, 11, 0, 0, TAU); ctx.fill();
+      ctx.fillStyle = '#d6ecff';
+      ctx.beginPath(); ctx.ellipse(0, -2, 3, 6, 0, 0, TAU); ctx.fill();
+      ctx.restore();
+    } else if (m.kind === 'heart') {
+      glowCircle(m.x, m.y + bob, m.r, 'rgba(125, 255, 168, 0.9)', 0.7);
+      ctx.save(); ctx.translate(m.x, m.y + bob); ctx.scale(1, 0.9);
+      ctx.fillStyle = '#7dffa8';
+      ctx.beginPath();
+      ctx.moveTo(0, 8);
+      ctx.bezierCurveTo(-12, -2, -8, -10, 0, -4);
+      ctx.bezierCurveTo(8, -10, 12, -2, 0, 8);
+      ctx.fill(); ctx.restore();
+    } else { // cinder
+      glowCircle(m.x, m.y + bob, m.r, 'rgba(255, 90, 70, 0.85)', 0.7);
+      ctx.save(); ctx.translate(m.x, m.y + bob); ctx.rotate(m.phase * 0.5);
+      ctx.fillStyle = '#ff5a46';
+      ctx.beginPath();
+      for (var k = 0; k < 8; k++) {
+        var a = (k / 8) * TAU, r2 = k % 2 === 0 ? m.r + 4 : m.r - 2;
+        ctx.lineTo(Math.cos(a) * r2, Math.sin(a) * r2);
+      }
+      ctx.closePath(); ctx.fill(); ctx.restore();
+      circle(m.x, m.y + bob, 4, '#ffb199');
+    }
+  }
+  function drawWisp(w) {
+    var frozen = freezeT > 0;
+    var col = frozen ? 'rgba(142, 203, 255, 0.9)' : 'rgba(160, 160, 175, 0.9)';
+    glowCircle(w.x, w.y, w.r, col, 0.5);
+    ctx.save(); ctx.translate(w.x, w.y);
+    ctx.fillStyle = frozen ? '#9db8d6' : '#6f6f80';
+    ctx.beginPath();
+    ctx.moveTo(0, -w.r);
+    ctx.bezierCurveTo(w.r, -w.r * 0.7, w.r, w.r * 0.5, w.r * 0.5, w.r);
+    ctx.bezierCurveTo(0, w.r * 0.6, -w.r * 0.5, w.r, -w.r, w.r * 0.5);
+    ctx.bezierCurveTo(-w.r, -w.r * 0.7, 0, -w.r, 0, -w.r);
+    ctx.fill();
+    // eyes
+    var blink = Math.sin(time * 2 + w.phase) > -0.9 ? 1 : 0.15;
+    ctx.fillStyle = frozen ? '#eaf6ff' : '#ff5a46';
+    ctx.beginPath(); ctx.ellipse(-5, -3, 2.6, 3.4 * blink, 0, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(5, -3, 2.6, 3.4 * blink, 0, 0, TAU); ctx.fill();
+    ctx.restore();
+  }
+  function drawHeart(x, y, filled) {
+    ctx.save(); ctx.translate(x, y); ctx.scale(0.9, 0.85);
+    ctx.fillStyle = filled ? '#ff6b81' : 'rgba(255,255,255,0.18)';
+    ctx.beginPath();
+    ctx.moveTo(0, 8);
+    ctx.bezierCurveTo(-12, -2, -8, -10, 0, -4);
+    ctx.bezierCurveTo(8, -10, 12, -2, 0, 8);
+    ctx.fill(); ctx.restore();
+  }
+  function drawHUD() {
+    ctx.save();
+    ctx.textBaseline = 'middle';
+    // score
+    ctx.fillStyle = 'rgba(10, 14, 34, 0.55)';
+    ctx.fillRect(0, 0, W, 46);
+    ctx.fillStyle = '#ffe9a8';
+    ctx.font = 'bold 22px system-ui, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText('SCORE ' + score, 14, 24);
+    ctx.fillStyle = '#9fb4d8';
+    ctx.font = '15px system-ui, sans-serif';
+    ctx.fillText('BEST ' + best, 150, 24);
+    // lives
+    for (var i = 0; i < 5; i++) drawHeart(W - 170 + i * 26, 24, i < lives);
+    // level + progress to next level
+    ctx.fillStyle = '#9fd8ff';
+    ctx.font = 'bold 15px system-ui, sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText('LEVEL ' + level, W - 190, 24);
+    var prog = endless || won ? 1 : Math.min(1, (score % 150) / 150);
+    ctx.fillStyle = 'rgba(255,255,255,0.15)';
+    ctx.fillRect(14, 50, 150, 6);
+    ctx.fillStyle = '#9fd8ff';
+    ctx.fillRect(14, 50, 150 * prog, 6);
+    // combo
+    if (combo > 1) {
+      ctx.fillStyle = '#ffd76a';
+      ctx.font = 'bold 20px system-ui, sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillText('COMBO x' + combo, 14, 78);
+      ctx.fillStyle = 'rgba(255,255,255,0.15)';
+      ctx.fillRect(14, 88, 110, 5);
+      ctx.fillStyle = '#ffd76a';
+      ctx.fillRect(14, 88, 110 * Math.max(0, comboT / 3), 5);
+    }
+    // freeze indicator
+    if (freezeT > 0) {
+      ctx.fillStyle = '#8ecbff';
+      ctx.font = 'bold 15px system-ui, sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillText('FROST ' + freezeT.toFixed(1) + 's', 14, 104);
+    }
+    // mute hint
+    ctx.fillStyle = 'rgba(159, 180, 216, 0.8)';
+    ctx.font = '13px system-ui, sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText(muted ? 'M: sound OFF' : 'M: sound ON   P: pause', W - 14, H - 14);
+    ctx.restore();
+  }
+  function panel(x, y, w, h) {
+    ctx.fillStyle = 'rgba(8, 12, 30, 0.82)';
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(x, y, w, h, 18); else ctx.rect(x, y, w, h);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255, 214, 106, 0.45)';
+    ctx.lineWidth = 2; ctx.stroke();
+  }
+  function drawTitle() {
+    var pw = Math.min(560, W - 40), ph = 380;
+    var px = (W - pw) / 2, py = (H - ph) / 2;
+    panel(px, py, pw, ph);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ffd76a';
+    ctx.font = 'bold 54px system-ui, sans-serif';
+    ctx.fillText('GLOWMOTH', W / 2, py + 74);
+    ctx.fillStyle = '#dfe8ff';
+    ctx.font = '17px system-ui, sans-serif';
+    ctx.fillText('A night-garden arcade game', W / 2, py + 106);
+    ctx.font = '15px system-ui, sans-serif';
+    ctx.fillStyle = '#b9c8e8';
+    var lines = [
+      'Catch golden pollen to score — chain pickups for combos up to x5.',
+      'Blue moonpetals freeze the ash-wisps. Green leafhearts heal +1 life.',
+      'Dodge red cinders and grey ash-wisps: each hit costs a life (you have 3).',
+      'Reach 750 points to earn the Night\'s Crown. Then keep flying, endless.',
+      '',
+      'Fly: Arrow keys / WASD, or hold mouse / touch and drag.',
+      'P pause   •   M mute   •   Enter / Space to start'
+    ];
+    for (var i = 0; i < lines.length; i++) ctx.fillText(lines[i], W / 2, py + 140 + i * 22);
+    // start button
+    var bw = 220, bh = 52, bx = (W - bw) / 2, by = py + ph - 76;
+    ctx.fillStyle = '#ffd76a';
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(bx, by, bw, bh, 12); else ctx.rect(bx, by, bw, bh);
+    ctx.fill();
+    ctx.fillStyle = '#241a05';
+    ctx.font = 'bold 21px system-ui, sans-serif';
+    ctx.fillText('START  ▶', W / 2, by + 27);
+    titleBtn = { x: bx, y: by, w: bw, h: bh };
+  }
+  function drawOver() {
+    var pw = Math.min(520, W - 40), ph = 300;
+    var px = (W - pw) / 2, py = (H - ph) / 2;
+    panel(px, py, pw, ph);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ff8a7a';
+    ctx.font = 'bold 42px system-ui, sans-serif';
+    ctx.fillText('THE LIGHT FADES', W / 2, py + 66);
+    ctx.fillStyle = '#ffe9a8';
+    ctx.font = 'bold 26px system-ui, sans-serif';
+    ctx.fillText('Score: ' + score + '   •   Best: ' + best, W / 2, py + 116);
+    ctx.fillStyle = '#b9c8e8';
+    ctx.font = '16px system-ui, sans-serif';
+    ctx.fillText(score >= best && score > 0 ? 'A new best — the garden remembers!' : 'The moth will fly again tonight.', W / 2, py + 150);
+    ctx.fillText('Enter / Space or click to fly again', W / 2, py + 182);
+    var bw = 240, bh = 52, bx = (W - bw) / 2, by = py + ph - 74;
+    ctx.fillStyle = '#ffd76a';
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(bx, by, bw, bh, 12); else ctx.rect(bx, by, bw, bh);
+    ctx.fill();
+    ctx.fillStyle = '#241a05';
+    ctx.font = 'bold 21px system-ui, sans-serif';
+    ctx.fillText('FLY AGAIN  ↻', W / 2, by + 27);
+    overBtn = { x: bx, y: by, w: bw, h: bh };
+  }
+  function drawWin() {
+    var pw = Math.min(520, W - 40), ph = 300;
+    var px = (W - pw) / 2, py = (H - ph) / 2;
+    panel(px, py, pw, ph);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ffd76a';
+    ctx.font = 'bold 40px system-ui, sans-serif';
+    ctx.fillText('★ NIGHT\'S CROWN ★', W / 2, py + 66);
+    ctx.fillStyle = '#ffe9a8';
+    ctx.font = 'bold 24px system-ui, sans-serif';
+    ctx.fillText('750 points — you win!', W / 2, py + 112);
+    ctx.fillStyle = '#b9c8e8';
+    ctx.font = '16px system-ui, sans-serif';
+    ctx.fillText('Pip wears the crown of the night garden.', W / 2, py + 146);
+    ctx.fillText('Keep flying endless, or start a fresh run.', W / 2, py + 174);
+    var bw = 250, bh = 50, bx = (W - bw) / 2, by = py + ph - 76;
+    ctx.fillStyle = '#ffd76a';
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(bx, by, bw, bh, 12); else ctx.rect(bx, by, bw, bh);
+    ctx.fill();
+    ctx.fillStyle = '#241a05';
+    ctx.font = 'bold 20px system-ui, sans-serif';
+    ctx.fillText('KEEP FLYING  ▶', W / 2, by + 26);
+    winBtn = { x: bx, y: by, w: bw, h: bh };
+  }
+  function drawPaused() {
+    ctx.fillStyle = 'rgba(8, 12, 30, 0.6)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#dfe8ff';
+    ctx.font = 'bold 40px system-ui, sans-serif';
+    ctx.fillText('PAUSED', W / 2, H / 2 - 10);
+    ctx.font = '17px system-ui, sans-serif';
+    ctx.fillText('Press P to resume', W / 2, H / 2 + 28);
+  }
+
+  var titleBtn = null, overBtn = null, winBtn = null;
+  function render() {
+    ctx.save();
+    if (shake > 0) ctx.translate(rr(-shake, shake) * 0.5, rr(-shake, shake) * 0.5);
+    drawBackground();
+    for (var i = 0; i < motes.length; i++) drawMote(motes[i]);
+    for (var j = 0; j < wisps.length; j++) drawWisp(wisps[j]);
+    // particles
+    for (var p = 0; p < parts.length; p++) {
+      var pt = parts[p];
+      ctx.globalAlpha = Math.max(0, pt.life / pt.max);
+      circle(pt.x, pt.y, pt.size, pt.color);
+    }
+    ctx.globalAlpha = 1;
+    // player (blink while invulnerable)
+    if (state === 'play' || state === 'pause' || state === 'win') {
+      if (!(invulnT > 0 && Math.floor(time * 12) % 2 === 0)) drawMoth(player.x, player.y, time);
+    } else if (state === 'title') {
+      drawMoth(W / 2, H * 0.24, time);
+    }
+    // floating texts
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 16px system-ui, sans-serif';
+    for (var q = 0; q < floats.length; q++) {
+      var fl = floats[q];
+      ctx.globalAlpha = Math.max(0, fl.life);
+      ctx.fillStyle = fl.color;
+      ctx.fillText(fl.text, fl.x, fl.y);
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+    if (state === 'play' || state === 'pause' || state === 'win') drawHUD();
+    if (hurtFlash > 0) { ctx.fillStyle = 'rgba(255, 60, 40,' + (hurtFlash * 0.5) + ')'; ctx.fillRect(0, 0, W, H); }
+    if (state === 'title') drawTitle();
+    else if (state === 'over') drawOver();
+    else if (state === 'win') drawWin();
+    else if (state === 'pause') drawPaused();
+  }
+
+  // ---------- input ----------
+  function inBtn(b, x, y) { return b && x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h; }
+  window.addEventListener('keydown', function (e) {
+    var k = e.key.toLowerCase();
+    if (['arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' '].indexOf(k) !== -1) e.preventDefault();
+    if (k === 'm') { muted = !muted; return; }
+    if (k === 'p') {
+      if (state === 'play') { state = 'pause'; announce('Paused.'); }
+      else if (state === 'pause') { state = 'play'; announce('Resumed.'); }
+      return;
+    }
+    if (k === 'enter' || k === ' ') {
+      if (state === 'title' || state === 'over') { startGame(); return; }
+      if (state === 'win') { endless = true; state = 'play'; announce('Endless mode — keep flying!'); return; }
+    }
+    keys[k] = true;
+  });
+  window.addEventListener('keyup', function (e) { keys[e.key.toLowerCase()] = false; });
+  function pointerPos(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+  canvas.addEventListener('pointerdown', function (e) {
+    ac();
+    var pos = pointerPos(e);
+    if (state === 'title' && inBtn(titleBtn, pos.x, pos.y)) { startGame(); return; }
+    if (state === 'over' && inBtn(overBtn, pos.x, pos.y)) { startGame(); return; }
+    if (state === 'win' && inBtn(winBtn, pos.x, pos.y)) { endless = true; state = 'play'; announce('Endless mode — keep flying!'); return; }
+    if (state === 'play') { pointer.active = true; pointer.x = pos.x; pointer.y = pos.y; }
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!pointer.active) return;
+    var pos = pointerPos(e);
+    pointer.x = pos.x; pointer.y = pos.y;
+  });
+  function endPointer() { pointer.active = false; }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+  canvas.addEventListener('pointerleave', endPointer);
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden && state === 'play') { state = 'pause'; announce('Paused.'); }
+  });
+
+  // ---------- screenshot / demo modes (?shot=start|play|end&seed=N) ----------
+  function applyShotMode() {
+    var shot = params.get('shot');
+    if (!shot) return;
+    if (shot === 'play') {
+      resetGame();
+      score = 120; combo = 3; comboT = 2.4; level = 1;
+      player.x = W * 0.42; player.y = H * 0.6;
+      // a lively, deterministic mid-game tableau
+      var kinds = ['pollen', 'pollen', 'pollen', 'pollen', 'pollen', 'pollen', 'petal', 'cinder', 'cinder', 'heart'];
+      for (var i = 0; i < kinds.length; i++) {
+        spawnMote(kinds[i]);
+        motes[i].x = W * (0.12 + 0.08 * i);
+        motes[i].y = H * (0.18 + 0.055 * ((i * 37) % 10));
+      }
+      wisps.push({ x: W * 0.78, y: H * 0.3, vx: 0, vy: 0, r: 15, phase: 1 });
+      wisps.push({ x: W * 0.2, y: H * 0.82, vx: 0, vy: 0, r: 15, phase: 2 });
+      burst(player.x + 40, player.y - 30, '#ffd76a', 12, 120);
+      addFloat(player.x, player.y - 40, '+30 x3', '#ffe9a8');
+      state = 'play';
+    } else if (shot === 'end') {
+      resetGame();
+      score = 480; best = Math.max(best, 480); lives = 0;
+      state = 'over';
+    } else { // start
+      resetGame();
+      state = 'title';
+    }
+  }
+
+  // ---------- main loop ----------
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.033, (now - last) / 1000);
+    last = now;
+    if (state === 'play') update(dt);
+    else time += dt; // keep the garden alive behind overlays
+    render();
+    requestAnimationFrame(frame);
+  }
+
+  resize();
+  buildSky();
+  resetGame();
+  player.x = W / 2; player.y = H * 0.72;
+  applyShotMode();
+  // Tiny read-only debug hook (used by automated play-tests; harmless in play).
+  window.__glowmoth = {
+    state: function () { return state; },
+    score: function () { return score; },
+    lives: function () { return lives; },
+    level: function () { return level; },
+    player: function () { return { x: Math.round(player.x), y: Math.round(player.y) }; },
+    motes: function () { return motes.map(function (m) { return { kind: m.kind, x: Math.round(m.x), y: Math.round(m.y) }; }); },
+    counts: function () { return { motes: motes.length, wisps: wisps.length, parts: parts.length }; }
+  };
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
